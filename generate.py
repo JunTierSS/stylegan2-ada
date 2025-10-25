@@ -1,4 +1,4 @@
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2021, NVIDIA CORPORATION.  All rights reserved.
 #
 # NVIDIA CORPORATION and its licensors retain all intellectual property
 # and proprietary rights in and to this software, related documentation
@@ -6,206 +6,75 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
+"""Generate images or videos using a pretrained StyleGAN network pickle.
+This version fixes:
+- Grayscale saving (1 channel) vs RGB.
+- Duplicate Click options (--network, --seeds, --trunc).
+- Python warnings ("is not" for ints; buggy conditionals with "or 'string'").
+- Robust slerp that returns numpy arrays (so image() can torch.from_numpy).
+- Minor video name logic and small cleanups.
+"""
 
-"""Generate images using pretrained network pickle."""
-
-import argparse
-import sys
 import os
 import subprocess
-import pickle
 import re
+from typing import List, Optional
 
-import scipy
+import click
+import dnnlib
 import numpy as np
 from numpy import linalg
 import PIL.Image
+import torch
 
-import dnnlib
-import dnnlib.tflib as tflib
-
-os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
-import moviepy.editor
+import legacy
 from opensimplex import OpenSimplex
 
-import warnings # mostly numpy warnings for me
-warnings.filterwarnings('ignore', category=FutureWarning)
-warnings.filterwarnings('ignore', category=DeprecationWarning)
+# ---------------------------------------------------------------------------
 
-#----------------------------------------------------------------------------
+class OSN:
+    min = -1
+    max = 1
 
-def create_image_grid(images, grid_size=None):
-    '''
-    Args:
-        images (np.array): images to place on the grid
-        grid_size (tuple(int, int)): size of grid (grid_w, grid_h)
-    Returns:
-        grid (np.array): image grid of size grid_size
-    '''
-    # Some sanity check:
-    assert images.ndim == 3 or images.ndim == 4
-    num, img_h, img_w = images.shape[0], images.shape[1], images.shape[2]
-    if grid_size is not None:
-        grid_w, grid_h = tuple(grid_size)
+    def __init__(self, seed: int, diameter: float):
+        self.tmp = OpenSimplex(seed)
+        self.d = diameter
+        self.x = 0
+        self.y = 0
+
+    def get_val(self, angle: float):
+        xoff = valmap(np.cos(angle), -1, 1, self.x, self.x + self.d)
+        yoff = valmap(np.sin(angle), -1, 1, self.y, self.y + self.d)
+        return self.tmp.noise2(xoff, yoff)
+
+
+def circularloop(nf: int, d: float, seed: Optional[int], seeds: Optional[List[int]]):
+    r = d / 2
+
+    if seeds is None:
+        rnd = np.random.RandomState(seed) if seed is not None else np.random
+        latents_a = rnd.randn(1, 512)
+        latents_b = rnd.randn(1, 512)
+        latents_c = rnd.randn(1, 512)
     else:
-        grid_w = max(int(np.ceil(np.sqrt(num))), 1)
-        grid_h = max((num - 1) // grid_w + 1, 1)
-    # Get the grid
-    grid = np.zeros(
-        [grid_h * img_h, grid_w * img_w] + list(images.shape[-1:]), dtype=images.dtype
-    )
-    for idx in range(num):
-        x = (idx % grid_w) * img_w
-        y = (idx // grid_w) * img_h
-        grid[y : y + img_h, x : x + img_w, ...] = images[idx]
-    return grid
+        if len(seeds) != 3:
+            raise AssertionError('Must choose exactly 3 seeds!')
+        latents_a = np.random.RandomState(int(seeds[0])).randn(1, 512)
+        latents_b = np.random.RandomState(int(seeds[1])).randn(1, 512)
+        latents_c = np.random.RandomState(int(seeds[2])).randn(1, 512)
 
-#----------------------------------------------------------------------------
+    latents = (latents_a, latents_b, latents_c)
 
-def generate_images(network_pkl, seeds, truncation_psi, outdir, class_idx=None, dlatents_npz=None, grid=False, save_vector=False, fixnoise=False, jpg_quality=0):
-    tflib.init_tf()
-    print('Loading networks from "%s"...' % network_pkl)
-    with dnnlib.util.open_url(network_pkl) as fp:
-        _G, _D, Gs = pickle.load(fp)
-
-    os.makedirs(outdir, exist_ok=True)
-    if(save_vector):
-        os.makedirs(outdir+"/vectors", exist_ok=True)
-
-    # Rendering format
-    optimized = bool(jpg_quality)
-    image_format = 'jpg' if jpg_quality else 'png'
-    jpg_quality = int(np.clip(jpg_quality, 1, 95)) # 'quality' keyword option ignored for PNG encoding
-
-    # Render images for a given dlatent vector.
-    if dlatents_npz is not None:
-        print(f'Generating images from dlatents file "{dlatents_npz}"')
-        dlatents = np.load(dlatents_npz)['dlatents']
-        max_l = 2 * int(np.log2(Gs.output_shape[-1]) - 1)  # max_l=18 for 1024x1024 models
-        if dlatents.shape[1:] != (max_l, 512):  # [N, max_l, 512]
-            actual_size = int(2**(dlatents.shape[1]//2+1))
-            print(f'''Mismatch of loaded dlatents and network! dlatents was created with network of size: {actual_size}\n
-                   {network_pkl} is of size {Gs.output_shape[-1]}''')
-            sys.exit(1)
-        imgs = Gs.components.synthesis.run(dlatents, output_transform=dict(func=tflib.convert_images_to_uint8, nchw_to_nhwc=True))
-        for i, img in enumerate(imgs):
-            fname = f'{outdir}/dlatent{i:02d}.{image_format}'
-            print (f'Saved {fname}')
-            PIL.Image.fromarray(img, 'RGB').save(fname, optimize=optimized, quality=jpg_quality)
-        return
-
-    # Render images for dlatents initialized from random seeds.
-    Gs_kwargs = {
-        'output_transform': dict(func=tflib.convert_images_to_uint8, nchw_to_nhwc=True),
-        'randomize_noise': False
-    }
-    if truncation_psi is not None:
-        Gs_kwargs['truncation_psi'] = truncation_psi
-
-    noise_vars = [var for name, var in Gs.components.synthesis.vars.items() if name.startswith('noise')]
-    label = np.zeros([1] + Gs.input_shapes[1][1:])
-    if class_idx is not None:
-        label[:, class_idx] = 1
-
-    images = []
-    for seed_idx, seed in enumerate(seeds):
-        print('Generating image for seed %d (%d/%d) ...' % (seed, seed_idx, len(seeds)))
-        rnd = np.random.RandomState(seed)
-        z = rnd.randn(1, *Gs.input_shape[1:]) # [minibatch, component]
-        if(fixnoise):
-            noise_rnd = np.random.RandomState(1) # fix noise
-            tflib.set_vars({var: noise_rnd.randn(*var.shape.as_list()) for var in noise_vars}) # [height, width]
-        else:
-            tflib.set_vars({var: rnd.randn(*var.shape.as_list()) for var in noise_vars}) # [height, width]
-        image = Gs.run(z, label, **Gs_kwargs) # [minibatch, height, width, channel]
-        images.append(image[0])
-        PIL.Image.fromarray(image[0], 'RGB').save(f'{outdir}/seed{seed:04d}.{image_format}', optimize=optimized, quality=jpg_quality)
-        if(save_vector):
-            np.save(f'{outdir}/vectors/seed{seed:04d}',z)
-            # np.savetxt(f'{outdir}/vectors/seed{seed:04d}',z)
-
-    # If user wants to save a grid of the generated images
-    if grid:
-        print('Generating image grid...')
-        PIL.Image.fromarray(create_image_grid(np.array(images)), 'RGB').save(f'{outdir}/grid.{image_format}', optimize=optimized, quality=jpg_quality)
-
-#----------------------------------------------------------------------------
-
-def truncation_traversal(network_pkl,npys,outdir,class_idx=None, seed=[0],start=-1.0,stop=1.0,increment=0.1,framerate=24):
-    tflib.init_tf()
-    print('Loading networks from "%s"...' % network_pkl)
-    with dnnlib.util.open_url(network_pkl) as fp:
-        _G, _D, Gs = pickle.load(fp)
-
-    os.makedirs(outdir, exist_ok=True)
-
-    Gs_kwargs = {
-        'output_transform': dict(func=tflib.convert_images_to_uint8, nchw_to_nhwc=True),
-        'randomize_noise': False
-    }
-
-    noise_vars = [var for name, var in Gs.components.synthesis.vars.items() if name.startswith('noise')]
-    label = np.zeros([1] + Gs.input_shapes[1][1:])
-    if class_idx is not None:
-        label[:, class_idx] = 1
-
-    count = 1
-    trunc = start
-
-    images = []
-    while trunc <= stop:
-        Gs_kwargs['truncation_psi'] = trunc
-        print('Generating truncation %0.2f' % trunc)
-
-        rnd = np.random.RandomState(seed)
-        z = rnd.randn(1, *Gs.input_shape[1:]) # [minibatch, component]
-        tflib.set_vars({var: rnd.randn(*var.shape.as_list()) for var in noise_vars}) # [height, width]
-        image = Gs.run(z, label, **Gs_kwargs) # [minibatch, height, width, channel]
-        images.append(image[0])
-        PIL.Image.fromarray(image[0], 'RGB').save(f'{outdir}/frame{count:05d}.png')
-
-        trunc+=increment
-        count+=1
-
-    cmd="ffmpeg -y -r {} -i {}/frame%05d.png -vcodec libx264 -pix_fmt yuv420p {}/truncation-traversal-seed{}-start{}-stop{}.mp4".format(framerate,outdir,outdir,seed[0],start,stop)
-    subprocess.call(cmd, shell=True)
-
-#----------------------------------------------------------------------------
-
-def valmap(value, istart, istop, ostart, ostop):
-  return ostart + (ostop - ostart) * ((value - istart) / (istop - istart))
-
-class OSN():
-  min=-1
-  max= 1
-
-  def __init__(self,seed,diameter):
-    self.tmp = OpenSimplex(seed)
-    self.d = diameter
-    self.x = 0
-    self.y = 0
-
-  def get_val(self,angle):
-    self.xoff = valmap(np.cos(angle), -1, 1, self.x, self.x + self.d);
-    self.yoff = valmap(np.sin(angle), -1, 1, self.y, self.y + self.d);
-    return self.tmp.noise2d(self.xoff,self.yoff)
-
-def get_noiseloop(endpoints, nf, d, start_seed):
-    features = []
     zs = []
-    for i in range(512):
-      features.append(OSN(i+start_seed,d))
-
-    inc = (np.pi*2)/nf
-    for f in range(nf):
-      z = np.random.randn(1, 512)
-      for i in range(512):
-        z[0,i] = features[i].get_val(inc*f)
-      zs.append(z)
-
+    current_pos = 0.0
+    step = 1.0 / max(1, nf)
+    while current_pos < 1.0:
+        zs.append(circular_interpolation(r, latents, current_pos))
+        current_pos += step
     return zs
 
-def circular_interpolation(radius, latents_persistent, latents_interpolate):
+
+def circular_interpolation(radius: float, latents_persistent, latents_interpolate: float):
     latents_a, latents_b, latents_c = latents_persistent
 
     latents_axis_x = (latents_a - latents_b).flatten() / linalg.norm(latents_a - latents_b)
@@ -217,600 +86,368 @@ def circular_interpolation(radius, latents_persistent, latents_interpolate):
     latents = latents_a + latents_x * latents_axis_x + latents_y * latents_axis_y
     return latents
 
-def get_circularloop(endpoints, nf, d, seed):
-    r = d/2
-    if seed:
-        np.random.RandomState(seed)
 
-    zs = []
-
-    rnd = np.random
-    latents_a = rnd.randn(1, Gs.input_shape[1])
-    latents_b = rnd.randn(1, Gs.input_shape[1])
-    latents_c = rnd.randn(1, Gs.input_shape[1])
-    latents = (latents_a, latents_b, latents_c)
-
-    current_pos = 0.0
-    step = 1./nf
-    
-    while(current_pos < 1.0):
-        zs.append(circular_interpolation(r, latents, current_pos))
-        current_pos += step
-    return zs
-
-def line_interpolate(zs, steps):
-   out = []
-   for i in range(len(zs)-1):
-    for index in range(steps):
-     fraction = index/float(steps)
-     out.append(zs[i+1]*fraction + zs[i]*(1-fraction))
-   return out
-
-# very hacky implementation of:
-# https://github.com/soumith/dcgan.torch/issues/14
-def slerp(val, low, high):
-    assert low.shape == high.shape
-
-    # z space
-    if len(low.shape) == 2:
-        out = np.zeros([low.shape[0],low.shape[1]])
-        for i in range(low.shape[0]):
-            omega = np.arccos(np.clip(np.dot(low[i]/np.linalg.norm(low[i]), high[i]/np.linalg.norm(high[i])), -1, 1))
-            so = np.sin(omega)
-            if so == 0:
-                out[i] = (1.0-val) * low[i] + val * high[i] # L'Hopital's rule/LERP
-            out[i] = np.sin((1.0-val)*omega) / so * low[i] + np.sin(val*omega) / so * high[i]
-    # w space
-    else:
-        out = np.zeros([low.shape[0],low.shape[1],low.shape[2]])
-
-        for i in range(low.shape[1]):
-            omega = np.arccos(np.clip(np.dot(low[0][i]/np.linalg.norm(low[0][i]), high[0][i]/np.linalg.norm(high[0][i])), -1, 1))
-            so = np.sin(omega)
-            if so == 0:
-                out[i] = (1.0-val) * low[0][i] + val * high[0][i] # L'Hopital's rule/LERP
-            out[0][i] = np.sin((1.0-val)*omega) / so * low[0][i] + np.sin(val*omega) / so * high[0][i]
-
-    return out
-
-def slerp_interpolate(zs, steps):
-   out = []
-   for i in range(len(zs)-1):
-    for index in range(steps):
-     fraction = index/float(steps)
-     out.append(slerp(fraction,zs[i],zs[i+1]))
-   return out
-
-def generate_zs_from_seeds(seeds,Gs):
-    zs = []
-    for seed_idx, seed in enumerate(seeds):
-        rnd = np.random.RandomState(seed)
-        z = rnd.randn(1, *Gs.input_shape[1:]) # [minibatch, component]
-        zs.append(z)
-    return zs
-
-def convertZtoW(latent, truncation_psi=0.7, truncation_cutoff=9):
-    dlatent = Gs.components.mapping.run(latent, None) # [seed, layer, component]
-    dlatent_avg = Gs.get_var('dlatent_avg') # [component]
-    dlatent = dlatent_avg + (dlatent - dlatent_avg) * truncation_psi
-
-    return dlatent
-
-def generate_latent_images(zs, truncation_psi, outdir, save_npy,prefix,vidname,framerate,class_idx=None):
-    Gs_kwargs = {
-        'output_transform': dict(func=tflib.convert_images_to_uint8, nchw_to_nhwc=True),
-        'randomize_noise': False
-    }
-    if truncation_psi is not None:
-        Gs_kwargs['truncation_psi'] = truncation_psi
-
-    noise_vars = [var for name, var in Gs.components.synthesis.vars.items() if name.startswith('noise')]
-    label = np.zeros([1] + Gs.input_shapes[1][1:])
-    if class_idx is not None:
-        label[:, class_idx] = 1
-
-    for z_idx, z in enumerate(zs):
-        if isinstance(z,list):
-          z = np.array(z).reshape(1,512)
-        elif isinstance(z,np.ndarray):
-          z.reshape(1,512)
-        print('Generating image for step %d/%d ...' % (z_idx, len(zs)))
-        noise_rnd = np.random.RandomState(1) # fix noise
-        tflib.set_vars({var: noise_rnd.randn(*var.shape.as_list()) for var in noise_vars}) # [height, width]
-        images = Gs.run(z, label, **Gs_kwargs) # [minibatch, height, width, channel]
-        PIL.Image.fromarray(images[0], 'RGB').save(f'{outdir}/frames/{prefix}{z_idx:05d}.png')
-        if save_npy:
-            np.save(f'{outdir}/vectors/{prefix}{z_idx:05d}.npz',z)
-            # np.savetxt(f'{outdir}/vectors/{prefix}{z_idx:05d}.txt',z)
-
-    cmd="ffmpeg -y -r {} -i {}/frames/{}%05d.png -vcodec libx264 -pix_fmt yuv420p {}/walk-{}-{}fps.mp4".format(framerate,outdir,prefix,outdir,vidname,framerate)
-    subprocess.call(cmd, shell=True)
-
-def generate_images_in_w_space(ws, truncation_psi,outdir,save_npy,prefix,vidname,framerate,class_idx=None):
-
-    Gs_kwargs = {
-        'output_transform': dict(func=tflib.convert_images_to_uint8, nchw_to_nhwc=True),
-        'randomize_noise': False
-    }
-    if truncation_psi is not None:
-        Gs_kwargs['truncation_psi'] = truncation_psi
-
-    noise_vars = [var for name, var in Gs.components.synthesis.vars.items() if name.startswith('noise')]
-    label = np.zeros([1] + Gs.input_shapes[1][1:])
-    if class_idx is not None:
-        label[:, class_idx] = 1
-
-    for w_idx, w in enumerate(ws):
-        print('Generating image for step %d/%d ...' % (w_idx, len(ws)))
-        noise_rnd = np.random.RandomState(1) # fix noise
-        tflib.set_vars({var: noise_rnd.randn(*var.shape.as_list()) for var in noise_vars}) # [height, width]
-        images = Gs.components.synthesis.run(w, **Gs_kwargs) # [minibatch, height, width, channel]
-        # images = Gs.run(w,label, **Gs_kwargs) # [minibatch, height, width, channel]
-        PIL.Image.fromarray(images[0], 'RGB').save(f'{outdir}/frames/{prefix}{w_idx:05d}.png')
-        if save_npy:
-            np.save(f'{outdir}/vectors/{prefix}{w_idx:05d}.npz',w)
-            # np.savetxt(f'{outdir}/vectors/{prefix}{w_idx:05d}.txt',w.reshape(w.shape[0], -1))
-
-    cmd="ffmpeg -y -r {} -i {}/frames/{}%05d.png -vcodec libx264 -pix_fmt yuv420p {}/walk-{}-{}fps.mp4".format(framerate,outdir,prefix,outdir,vidname,framerate)
-    subprocess.call(cmd, shell=True)
-
-def generate_latent_walk(network_pkl, truncation_psi, outdir, walk_type, frames, seeds, npys, save_vector, diameter=2.0, start_seed=0, framerate=24 ):
-    global _G, _D, Gs, noise_vars
-    tflib.init_tf()
-
-    print('Loading networks from "%s"...' % network_pkl)
-    with dnnlib.util.open_url(network_pkl) as fp:
-        _G, _D, Gs = pickle.load(fp)
-
-    os.makedirs(outdir, exist_ok=True)
-    os.makedirs(outdir+"/frames", exist_ok=True)
-    if(save_vector):
-        os.makedirs(outdir+"/vectors", exist_ok=True)
-
-    # Render images for dlatents initialized from random seeds.
-    Gs_kwargs = {
-        'output_transform': dict(func=tflib.convert_images_to_uint8, nchw_to_nhwc=True),
-        'randomize_noise': False
-    }
-    if truncation_psi is not None:
-        Gs_kwargs['truncation_psi'] = truncation_psi
-
-    noise_vars = [var for name, var in Gs.components.synthesis.vars.items() if name.startswith('noise')]
-    zs = []
-    ws =[]
-
-
-    # npys specified, let's work with these instead of seeds
-    # npys must be saved as W's (arrays of 18x512)
-    if npys and (len(npys) > 0):
-        ws = npys
-
-
-    wt = walk_type.split('-')
-
-    if wt[0] == 'line':
-        if seeds and (len(seeds) > 0):
-            zs = generate_zs_from_seeds(seeds,Gs)
-
-        if ws == []:
-            number_of_steps = int(frames/(len(zs)-1))+1
-        else:
-            number_of_steps = int(frames/(len(ws)-1))+1
-
-        if (len(wt)>1 and wt[1] == 'w'):
-          if ws == []:
-            for i in range(len(zs)):
-              ws.append(convertZtoW(zs[i],truncation_psi))
-
-          points = line_interpolate(ws,number_of_steps)
-          # zpoints = line_interpolate(zs,number_of_steps)
-
-        else:
-          points = line_interpolate(zs,number_of_steps)
-    elif wt[0] == 'sphere':
-        print('slerp')
-        if seeds and (len(seeds) > 0):
-            zs = generate_zs_from_seeds(seeds,Gs)
-
-        if ws == []:
-            number_of_steps = int(frames/(len(zs)-1))+1
-        else:
-            number_of_steps = int(frames/(len(ws)-1))+1
-
-        if (len(wt)>1 and wt[1] == 'w'):
-          if ws == []:
-            for i in range(len(zs)):
-              ws.append(convertZtoW(zs[i],truncation_psi))
-
-          points = slerp_interpolate(ws,number_of_steps)
-
-        else:
-          points = slerp_interpolate(zs,number_of_steps)
-
-    # from Gene Kogan
-    elif wt[0] == 'bspline':
-        # bspline in w doesnt work yet
-        # if (len(walk_type)>1 and walk_type[1] == 'w'):
-        #   ws = []
-        #   for i in range(len(zs)):
-        #     ws.append(convertZtoW(zs[i]))
-
-        #   print(ws[0].shape)
-        #   w = []
-        #   for i in range(len(ws)):
-        #     w.append(np.asarray(ws[i]).reshape(512,18))
-        #   points = get_latent_interpolation_bspline(ws,frames,3, 20, shuffle=False)
-        # else:
-          z = []
-          for i in range(len(zs)):
-            z.append(np.asarray(zs[i]).reshape(512))
-          points = get_latent_interpolation_bspline(z,frames,3, 20, shuffle=False)
-
-    # from Dan Shiffman: https://editor.p5js.org/dvs/sketches/Gb0xavYAR
-    elif wt[0] == 'noiseloop':
-        points = get_noiseloop(None,frames,diameter,start_seed)
-    elif wt[0] == 'circularloop':
-        points = get_circularloop(None,frames,diameter,start_seed)
-
-    if (len(wt)>1 and wt[1] == 'w'):
-        #added for npys
-        if seeds:
-            seed_out = 'w-' + wt[0] + ('-'.join([str(seed) for seed in seeds]))
-        else:
-            seed_out = 'w-' + wt[0] + '-dlatents'
-
-        generate_images_in_w_space(points, truncation_psi,outdir,save_vector,'frame', seed_out, framerate)
-    # elif (len(wt)>1 and wt[1] == 'w'):
-    #   print('%s is not currently supported in w space, please change your interpolation type' % (wt[0]))
-    else:
-        if(len(wt)>1):
-            seed_out = 'z-' + wt[0] + ('-'.join([str(seed) for seed in seeds]))
-        else:
-            seed_out = 'z-' + walk_type + '-seed' +str(start_seed)
-        generate_latent_images(points, truncation_psi, outdir, save_vector,'frame', seed_out, framerate)
-
-#----------------------------------------------------------------------------
-
-def generate_neighbors(network_pkl, seeds, npys, diameter, truncation_psi, num_samples, save_vector, outdir):
-    global _G, _D, Gs, noise_vars
-    tflib.init_tf()
-    print('Loading networks from "%s"...' % network_pkl)
-    with dnnlib.util.open_url(network_pkl) as fp:
-        _G, _D, Gs = pickle.load(fp)
-
-    os.makedirs(outdir, exist_ok=True)
-
-    # Render images for dlatents initialized from random seeds.
-    Gs_kwargs = {
-        'output_transform': dict(func=tflib.convert_images_to_uint8, nchw_to_nhwc=True),
-        'randomize_noise': False,
-        'truncation_psi': truncation_psi
-    }
-
-    noise_vars = [var for name, var in Gs.components.synthesis.vars.items() if name.startswith('noise')]
-
-    for seed_idx, seed in enumerate(seeds):
-        print('Generating image for seed %d (%d/%d) ...' % (seed, seed_idx+1, len(seeds)))
-        rnd = np.random.RandomState(seed)
-
-        og_z = rnd.randn(1, *Gs.input_shape[1:]) # [minibatch, component]
-        tflib.set_vars({var: rnd.randn(*var.shape.as_list()) for var in noise_vars}) # [height, width]
-        images = Gs.run(og_z, None, **Gs_kwargs) # [minibatch, height, width, channel]
-        # PIL.Image.fromarray(images[0], 'RGB').save(dnnlib.make_run_dir_path('seed%04d.png' % seed))
-        PIL.Image.fromarray(images[0], 'RGB').save(f'{outdir}/seed{seed:05d}.png')
-
-        zs = []
-        z_prefix = 'seed%04d_neighbor' % seed
-
-        for s in range(num_samples):
-            random = np.random.uniform(-diameter,diameter,[1,512])
-#             zs.append(np.clip((og_z+random),-1,1))
-            new_z = np.clip(np.add(og_z,random),-1,1)
-            images = Gs.run(new_z, None, **Gs_kwargs) # [minibatch, height, width, channel]
-            # PIL.Image.fromarray(images[0], 'RGB').save(dnnlib.make_run_dir_path('%s%04d.png' % (z_prefix,s)))
-            PIL.Image.fromarray(images[0], 'RGB').save(f'{outdir}/{z_prefix}{s:05d}.png')
-            # generate_latent_images(zs, truncation_psi, save_vector, z_prefix)
-            if save_vector:
-                np.save(dnnlib.make_run_dir_path('%s%05d.npy' % (z_prefix,s)), new_z)
-
-
-
-#----------------------------------------------------------------------------
-
-def lerp_video(network_pkl,                # Path to pretrained model pkl file
-               seeds,                      # Random seeds
-               grid_w=None,                # Number of columns
-               grid_h=None,                # Number of rows
-               truncation_psi=1.0,         # Truncation trick
-               outdir='out',               # Output dir
-               slowdown=1,                 # Slowdown of the video (power of 2)
-               duration_sec=30.0,          # Duration of video in seconds
-               smoothing_sec=3.0,
-               mp4_fps=30,
-               mp4_codec="libx264",
-               mp4_bitrate="16M"):
-    # Sanity check regarding slowdown
-    message = 'slowdown must be a power of 2 (1, 2, 4, 8, ...) and greater than 0!'
-    assert slowdown & (slowdown - 1) == 0 and slowdown > 0, message
-    # Initialize TensorFlow and create outdir
-    tflib.init_tf()
-    os.makedirs(outdir, exist_ok=True)
-    # Total duration of video and number of frames to generate
-    num_frames = int(np.rint(duration_sec * mp4_fps))
-    total_duration = duration_sec * slowdown
-
-    print(f'Loading network from {network_pkl}...')
-    with dnnlib.util.open_url(network_pkl) as fp:
-        _G, _D, Gs = pickle.load(fp)
-
-    print("Generating latent vectors...")
-    # If there's more than one seed provided and the shape isn't specified
-    if grid_w == grid_h == None and len(seeds) >= 1:
-        # number of images according to the seeds provided
-        num = len(seeds)
-        # Get the grid width and height according to num:
-        grid_w = max(int(np.ceil(np.sqrt(num))), 1)
-        grid_h = max((num - 1) // grid_w + 1, 1)
-        grid_size = [grid_w, grid_h]
-        # [frame, image, channel, component]:
-        shape = [num_frames] + Gs.input_shape[1:]
-        # Get the latents:
-        all_latents = np.stack([np.random.RandomState(seed).randn(*shape).astype(np.float32) for seed in seeds], axis=1)
-    # If only one seed is provided and the shape is specified
-    elif None not in (grid_w, grid_h) and len(seeds) == 1:
-        # Otherwise, the user gives one seed and the grid width and height:
-        grid_size = [grid_w, grid_h]
-        # [frame, image, channel, component]:
-        shape = [num_frames, np.prod(grid_size)] + Gs.input_shape[1:]
-        # Get the latents with the random state:
-        random_state = np.random.RandomState(seeds)
-        all_latents = random_state.randn(*shape).astype(np.float32)
-    else:
-        print("Error: wrong combination of arguments! Please provide \
-                either one seed and the grid width and height, or a \
-                list of seeds to use.")
-        sys.exit(1)
-
-    all_latents = scipy.ndimage.gaussian_filter(
-        all_latents,
-        [smoothing_sec * mp4_fps] + [0] * len(Gs.input_shape),
-        mode="wrap"
-    )
-    all_latents /= np.sqrt(np.mean(np.square(all_latents)))
-    # Name of the final mp4 video
-    mp4 = f"{grid_w}x{grid_h}-lerp-{slowdown}xslowdown.mp4"
-
-    # Aux function to slowdown the video by 2x
-    def double_slowdown(latents, duration_sec, num_frames):
-        # Make an empty latent vector with double the amount of frames
-        z = np.empty(np.multiply(latents.shape, [2, 1, 1]), dtype=np.float32)
-        # Populate it
-        for i in range(len(latents)):
-            z[2*i] = latents[i]
-        # Interpolate in the odd frames
-        for i in range(1, len(z), 2):
-            # For the last frame, we loop to the first one
-            if i == len(z) - 1:
-                z[i] = (z[0] + z[i-1]) / 2
-            else:
-                z[i] = (z[i-1] + z[i+1]) / 2
-        # We also need to double the duration_sec and num_frames
-        duration_sec *= 2
-        num_frames *= 2
-        # Return the new latents, and the two previous quantities
-        return z, duration_sec, num_frames
-
-    while slowdown > 1:
-        all_latents, duration_sec, num_frames = double_slowdown(all_latents, duration_sec, num_frames)
-        slowdown //= 2
-
-    # Define the kwargs for the Generator:
-    Gs_kwargs = dnnlib.EasyDict()
-    Gs_kwargs.output_transform = dict(func=tflib.convert_images_to_uint8,
-                                      nchw_to_nhwc=True)
-    Gs_kwargs.randomize_noise = False
-    if truncation_psi is not None:
-        Gs_kwargs.truncation_psi = truncation_psi
-
-    # Aux function: Frame generation func for moviepy.
-    def make_frame(t):
-        frame_idx = int(np.clip(np.round(t * mp4_fps), 0, num_frames - 1))
-        latents = all_latents[frame_idx]
-        # Get the images (with labels = None)
-        images = Gs.run(latents, None, **Gs_kwargs)
-        # Generate the grid for this timestamp:
-        grid = create_image_grid(images, grid_size)
-        # grayscale => RGB
-        if grid.shape[2] == 1:
-            grid = grid.repeat(3, 2)
-        return grid
-
-    # Generate video using make_frame:
-    print(f'Generating interpolation video of length: {total_duration} seconds...')
-    videoclip = moviepy.editor.VideoClip(make_frame, duration=duration_sec)
-    videoclip.write_videofile(os.path.join(outdir, mp4),
-                              fps=mp4_fps,
-                              codec=mp4_codec,
-                              bitrate=mp4_bitrate)
-
-#----------------------------------------------------------------------------
-
-def _parse_num_range(s):
-    '''Accept either a comma separated list of numbers 'a,b,c' or a range 'a-c' and return as a list of ints.'''
-
+def num_range(s: str) -> List[int]:
+    """Accept either a comma separated list 'a,b,c' or a range 'a-c' and return as list of ints."""
     range_re = re.compile(r'^(\d+)-(\d+)$')
     m = range_re.match(s)
     if m:
-        return range(int(m.group(1)), int(m.group(2))+1)
+        return list(range(int(m.group(1)), int(m.group(2)) + 1))
     vals = s.split(',')
-    return [int(x) for x in vals]
-
-# My extended version of this helper function:
-def _parse_num_range_ext(s):
-    '''
-    Input:
-        s (str): Comma separated string of numbers 'a,b,c', a range 'a-c', or
-                 even a combination of both 'a,b-c', 'a-b,c', 'a,b-c,d,e-f,...'
-    Output:
-        nums (list): Ordered list of ascending ints in s, with repeating values
-                     deleted (can be modified to not do either of this)
-    '''
-    # Sanity check 0:
-    # In case there's a space between the numbers (impossible due to argparse,
-    # but hey, I am that paranoid):
-    s = s.replace(' ', '')
-    # Split w.r.t comma
-    str_list = s.split(',')
-    nums = []
-    for el in str_list:
-        if '-' in el:
-            # The range will be 'a-b', so we wish to find both a and b using re:
-            range_re = re.compile(r'^(\d+)-(\d+)$')
-            match = range_re.match(el)
-            # We get the two numbers:
-            a = int(match.group(1))
-            b = int(match.group(2))
-            # Sanity check 1: accept 'a-b' or 'b-a', with a<=b:
-            if a <= b: r = [n for n in range(a, b + 1)]
-            else: r = [n for n in range(b, a + 1)]
-            # Use extend since r will also be an array:
-            nums.extend(r)
-        else:
-            # It's a single number, so just append it:
-            nums.append(int(el))
-    # Sanity check 2: delete repeating numbers:
-    nums = list(set(nums))
-    # Return the numbers in ascending order:
-    return sorted(nums)
-
-#----------------------------------------------------------------------------
-
-def _parse_npy_files(files):
-    '''Accept a comma separated list of npy files and return a list of z vectors.'''
-
-    zs =[]
-
-    file_list = files.split(",")
+    return [int(x) for x in vals if x != '']
 
 
-    for f in file_list:
-        # load numpy array
-        arr = np.load(f)
-        # check if it's actually npz:
-        if 'dlatents' in arr:
-            arr = arr['dlatents']
-        zs.append(arr)
+def size_range(s: str) -> List[int]:
+    """Accept a range 'a-b' and return as a list [H, W]."""
+    return [int(v) for v in s.split('-')][::-1]
 
 
+def line_interpolate(zs, steps, easing):
+    out = []
+    for i in range(len(zs) - 1):
+        for index in range(steps):
+            t = index / float(max(1, steps))
+            if easing == 'linear':
+                fr = t
+            elif easing == 'easeInOutQuad':
+                fr = 2 * t * t if t < 0.5 else (-2 * t * t) + (4 * t) - 1
+            elif easing == 'bounceEaseOut':
+                if t < 4 / 11:
+                    fr = 121 * t * t / 16
+                elif t < 8 / 11:
+                    fr = (363 / 40.0 * t * t) - (99 / 10.0 * t) + 17 / 5.0
+                elif t < 9 / 10:
+                    fr = (4356 / 361.0 * t * t) - (35442 / 1805.0 * t) + 16061 / 1805.0
+                else:
+                    fr = (54 / 5.0 * t * t) - (513 / 25.0 * t) + 268 / 25.0
+            elif easing == 'circularEaseOut':
+                fr = np.sqrt((2 - t) * t)
+            elif easing == 'circularEaseOut2':
+                fr = np.sqrt(np.sqrt((2 - t) * t))
+            elif easing == 'backEaseOut':
+                p = 1 - t
+                fr = 1 - (p * p * p - p * np.sin(p * np.pi))
+            else:
+                fr = t
+            out.append(zs[i + 1] * fr + zs[i] * (1 - fr))
+    return out
 
+
+def noiseloop(nf: int, d: float, seed: int):
+    if seed:
+        np.random.RandomState(seed)
+    features = [OSN(i + seed, d) for i in range(512)]
+    inc = (np.pi * 2) / max(1, nf)
+
+    zs = []
+    for f in range(nf):
+        z = np.random.randn(1, 512)
+        for i in range(512):
+            z[0, i] = features[i].get_val(inc * f)
+        zs.append(z)
     return zs
 
+
+def save_image_from_tensor(img_tensor: torch.Tensor, out_path: str):
+    """Save [N,H,W,C] uint8 tensor as PNG, handling 1 or 3 channels."""
+    arr = img_tensor[0].cpu().numpy()  # HWC
+    if arr.ndim == 3 and arr.shape[2] == 1:
+        # grayscale
+        PIL.Image.fromarray(arr[:, :, 0], mode='L').save(out_path)
+    elif arr.ndim == 3 and arr.shape[2] == 3:
+        PIL.Image.fromarray(arr, mode='RGB').save(out_path)
+    elif arr.ndim == 2:
+        PIL.Image.fromarray(arr, mode='L').save(out_path)
+    else:
+        # Fallback: if single-channel CHW slipped through
+        if arr.ndim == 3 and arr.shape[0] == 1:
+            PIL.Image.fromarray(arr[0], mode='L').save(out_path)
+        else:
+            raise ValueError(f"Unsupported image shape for saving: {arr.shape}")
+
+
+def images(G, device, inputs, space, truncation_psi, label, noise_mode, outdir, start=None, stop=None):
+    tp = start
+    tp_i = None
+    if start is not None and stop is not None:
+        tp_i = (stop - start) / max(1, len(inputs))
+
+    for idx, i in enumerate(inputs):
+        print(f'Generating image for frame {idx}/{len(inputs)} ...')
+        if space == 'z':
+            if isinstance(i, torch.Tensor):
+                z = i.to(device)
+            else:
+                z = torch.from_numpy(i).to(device)
+            if tp is not None and tp_i is not None:
+                img = G(z, label, truncation_psi=tp, noise_mode=noise_mode)
+                tp += tp_i
+            else:
+                img = G(z, label, truncation_psi=truncation_psi, noise_mode=noise_mode)
+        else:
+            # space == 'w'
+            if not isinstance(i, torch.Tensor):
+                i = torch.from_numpy(i).to(device)
+            if i.ndim == 2:
+                i = i.unsqueeze(0)
+            img = G.synthesis(i, noise_mode=noise_mode, force_fp32=True)
+        img = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+        save_image_from_tensor(img, f'{outdir}/frame{idx:04d}.png')
+
+
+def interpolate(G, device, projected_w, seeds, random_seed, space, truncation_psi, label, frames, noise_mode, outdir, interpolation, easing, diameter, start=None, stop=None):
+    if interpolation in ('noiseloop', 'circularloop'):
+        if seeds is not None:
+            print(f'Warning: interpolation type "{interpolation}" ignores --seeds and uses random/circular seeds.')
+        if interpolation == 'noiseloop':
+            points = noiseloop(frames, diameter, random_seed or 0)
+        else:
+            points = circularloop(frames, diameter, random_seed or 0, seeds)
+    else:
+        if projected_w is not None:
+            points = np.load(projected_w)['w']
+        else:
+            points = seeds_to_zs(G, seeds)
+            if space == 'w':
+                points = zs_to_ws(G, device, label, truncation_psi, points)
+        if interpolation == 'linear':
+            points = line_interpolate(points, frames, easing)
+        elif interpolation == 'slerp':
+            points = slerp_interpolate(points, frames)
+
+    images(G, device, points, space, truncation_psi, label, noise_mode, outdir, start, stop)
+
+
+def seeds_to_zs(G, seeds):
+    zs = []
+    for seed in seeds or []:
+        z = np.random.RandomState(int(seed)).randn(1, G.z_dim)
+        zs.append(z)
+    return zs
+
+
+# Spherical linear interpolation returning NUMPY arrays (so images() can torch.from_numpy)
+# Accepts numpy or torch inputs; converts to numpy internally.
+
+def slerp(t, v0, v1, DOT_THRESHOLD=0.9995):
+    def to_np(x):
+        if isinstance(x, torch.Tensor):
+            return x.detach().cpu().numpy()
+        return np.asarray(x)
+
+    v0 = to_np(v0)
+    v1 = to_np(v1)
+
+    v0_copy = np.copy(v0)
+    v1_copy = np.copy(v1)
+
+    v0n = v0 / np.linalg.norm(v0)
+    v1n = v1 / np.linalg.norm(v1)
+    dot = np.sum(v0n * v1n)
+
+    if np.abs(dot) > DOT_THRESHOLD:
+        return (1.0 - t) * v0_copy + t * v1_copy
+
+    theta_0 = np.arccos(dot)
+    sin_theta_0 = np.sin(theta_0)
+    theta_t = theta_0 * t
+    s0 = np.sin(theta_0 - theta_t) / sin_theta_0
+    s1 = np.sin(theta_t) / sin_theta_0
+    v2 = s0 * v0_copy + s1 * v1_copy
+    return v2
+
+
+def slerp_interpolate(zs, steps):
+    out = []
+    for i in range(len(zs) - 1):
+        for index in range(steps):
+            fraction = index / float(max(1, steps))
+            out.append(slerp(fraction, zs[i], zs[i + 1]))
+    return out
+
+
+def truncation_traversal(G, device, z_seeds, label, start, stop, increment, noise_mode, outdir):
+    count = 1
+    trunc = start
+
+    z = seeds_to_zs(G, z_seeds)[0]
+    z = torch.from_numpy(np.asarray(z)).to(device)
+
+    while trunc <= stop:
+        print(f'Generating truncation {trunc:0.2f}')
+        img = G(z, label, truncation_psi=trunc, noise_mode=noise_mode)
+        img = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+        save_image_from_tensor(img, f'{outdir}/frame{count:04d}.png')
+        trunc += increment
+        count += 1
+
+
+def valmap(value, istart, istop, ostart, ostop):
+    return ostart + (ostop - ostart) * ((value - istart) / (istop - istart))
+
+
+def zs_to_ws(G, device, label, truncation_psi, zs):
+    ws = []
+    for z in zs:
+        zt = torch.from_numpy(z).to(device)
+        w = G.mapping(zt, label, truncation_psi=truncation_psi, truncation_cutoff=8)
+        ws.append(w)
+    return ws
+
 #----------------------------------------------------------------------------
 
-_examples = '''examples:
+@click.command()
+@click.pass_context
+@click.option('--network', 'network_pkl', help='Network pickle filename', required=True)
+@click.option('--seeds', type=num_range, help='List of random seeds')
+@click.option('--trunc', 'truncation_psi', type=float, help='Truncation psi', default=1.0, show_default=True)
+@click.option('--class', 'class_idx', type=int, help='Class label (unconditional if not specified)')
+@click.option('--diameter', type=float, help='Diameter for circular/noise loops', default=100.0, show_default=True)
+@click.option('--frames', type=int, help='Frames between keypoints / total for loops', default=240, show_default=True)
+@click.option('--fps', type=int, help='Framerate for video', default=24, show_default=True)
+@click.option('--increment', type=float, help='Truncation increment value (traversal)', default=0.01, show_default=True)
+@click.option('--interpolation', type=click.Choice(['linear', 'slerp', 'noiseloop', 'circularloop']), default='linear', help='Interpolation type', required=True)
+@click.option('--easing', type=click.Choice(['linear', 'easeInOutQuad', 'bounceEaseOut','circularEaseOut','circularEaseOut2','backEaseOut']), default='linear', help='Easing', required=True)
+@click.option('--noise-mode', help='Noise mode', type=click.Choice(['const', 'random', 'none']), default='const', show_default=True)
+@click.option('--outdir', help='Where to save the output images/video', type=str, required=True, metavar='DIR')
+@click.option('--process', type=click.Choice(['image', 'interpolation','truncation','interpolation-truncation']), default='image', help='Generation method', required=True)
+@click.option('--projected-w', help='Projection result file (npz with w)', type=str, metavar='FILE')
+@click.option('--random_seed', type=int, help='Random seed for loops', default=0, show_default=True)
+@click.option('--scale-type', type=click.Choice(['pad', 'padside', 'symm','symmside']), default='pad', help='Scaling method for --size')
+@click.option('--size', type=size_range, help='Output size (format x-y)')
+@click.option('--space', type=click.Choice(['z', 'w']), default='z', help='Latent space', required=True)
+@click.option('--start', type=float, help='Starting truncation value (traversal)', default=0.0, show_default=True)
+@click.option('--stop', type=float, help='Stopping truncation value (traversal)', default=1.0, show_default=True)
 
-  # Generate curated MetFaces images without truncation (Fig.10 left)
-  python %(prog)s --outdir=out --trunc=1 --seeds=85,265,297,849 \\
-      --network=https://nvlabs-fi-cdn.nvidia.com/stylegan2-ada/pretrained/metfaces.pkl
+def generate_images(
+    ctx: click.Context,
+    easing: str,
+    interpolation: str,
+    increment: Optional[float],
+    network_pkl: str,
+    process: str,
+    random_seed: Optional[int],
+    diameter: Optional[float],
+    scale_type: Optional[str],
+    size: Optional[List[int]],
+    seeds: Optional[List[int]],
+    space: str,
+    fps: Optional[int],
+    frames: Optional[int],
+    truncation_psi: float,
+    noise_mode: str,
+    outdir: str,
+    class_idx: Optional[int],
+    projected_w: Optional[str],
+    start: Optional[float],
+    stop: Optional[float],
+):
+    """Generate images/videos using a pretrained network pickle.
 
-  # Generate uncurated MetFaces images with truncation (Fig.12 upper left)
-  python %(prog)s --outdir=out --trunc=0.7 --seeds=600-605 \\
-      --network=https://nvlabs-fi-cdn.nvidia.com/stylegan2-ada/pretrained/metfaces.pkl
+    Examples:
 
-  # Generate class conditional CIFAR-10 images (Fig.17 left, Car)
-  python %(prog)s --outdir=out --trunc=1 --seeds=0-35 --class=1 \\
-      --network=https://nvlabs-fi-cdn.nvidia.com/stylegan2-ada/pretrained/cifar10.pkl
+    \b
+    # Generate images without truncation
+    python generate.py --outdir=out --trunc=1 --seeds=85,265,297,849 \
+        --network=https://nvlabs-fi-cdn.nvidia.com/stylegan2-ada-pytorch/pretrained/metfaces.pkl
 
-  # Render image from projected latent vector
-  python %(prog)s --outdir=out --dlatents=out/dlatents.npz \\
-      --network=https://nvlabs-fi-cdn.nvidia.com/stylegan2-ada/pretrained/ffhq.pkl
-'''
+    \b
+    # Generate with truncation psi
+    python generate.py --outdir=out --trunc=0.7 --seeds=600-605 \
+        --network=metfaces.pkl
+
+    \b
+    # Class-conditional (e.g., class 1)
+    python generate.py --outdir=out --seeds=0-35 --class=1 \
+        --network=cifar10.pkl
+    """
+
+    # Custom size support
+    if size:
+        print('Render custom size:', size)
+        print('Padding method:', scale_type)
+        custom = True
+    else:
+        custom = False
+
+    G_kwargs = dnnlib.EasyDict()
+    G_kwargs.size = size
+    G_kwargs.scale_type = scale_type
+
+    print(f'Loading networks from "{network_pkl}"...')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    with dnnlib.util.open_url(network_pkl) as f:
+        G = legacy.load_network_pkl(f, custom=custom, **G_kwargs)['G_ema'].to(device)  # type: ignore
+
+    os.makedirs(outdir, exist_ok=True)
+
+    # Projected W branch
+    if process == 'image' and projected_w is not None:
+        if seeds is not None:
+            print('Warning: --seeds is ignored when using --projected-w')
+        print(f'Generating images from projected W "{projected_w}"')
+        ws = np.load(projected_w)['w']
+        ws = torch.tensor(ws, device=device)
+        assert ws.shape[1:] == (G.num_ws, G.w_dim)
+        for idx, w in enumerate(ws):
+            img = G.synthesis(w.unsqueeze(0), noise_mode=noise_mode)
+            img = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+            save_image_from_tensor(img, f'{outdir}/proj{idx:02d}.png')
+        return
+
+    # Labels for conditional G
+    label = torch.zeros([1, G.c_dim], device=device)
+    if G.c_dim != 0:
+        if class_idx is None:
+            ctx.fail('Must specify class label with --class when using a conditional network')
+        label[:, class_idx] = 1
+    elif class_idx is not None:
+        print('warn: --class ignored on unconditional network')
+
+    if process == 'image':
+        if not seeds:
+            ctx.fail('--seeds is required when not using --projected-w')
+        for si, seed in enumerate(seeds):
+            print(f'Generating image for seed {seed} ({si+1}/{len(seeds)}) ...')
+            z = torch.from_numpy(np.random.RandomState(int(seed)).randn(1, G.z_dim)).to(device)
+            img = G(z, label, truncation_psi=truncation_psi, noise_mode=noise_mode)
+            img = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+            save_image_from_tensor(img, f'{outdir}/seed{int(seed):04d}.png')
+
+    elif process in ('interpolation', 'interpolation-truncation'):
+        dirpath = os.path.join(outdir, 'frames')
+        os.makedirs(dirpath, exist_ok=True)
+
+        if seeds is not None:
+            seedstr = '_'.join([str(int(s)) for s in seeds])
+            vidname = f'{process}-{interpolation}-seeds_{seedstr}-{fps}fps'
+        elif interpolation in ('noiseloop', 'circularloop'):
+            vidname = f'{process}-{interpolation}-{diameter}dia-seed_{random_seed}-{fps}fps'
+        else:
+            vidname = f'{process}-{interpolation}-{fps}fps'
+
+        if process == 'interpolation-truncation':
+            interpolate(G, device, projected_w, seeds, random_seed, space, truncation_psi, label, frames, noise_mode, dirpath, interpolation, easing, diameter, start, stop)
+        else:
+            interpolate(G, device, projected_w, seeds, random_seed, space, truncation_psi, label, frames, noise_mode, dirpath, interpolation, easing, diameter)
+
+        cmd = f'ffmpeg -y -r {fps} -i {dirpath}/frame%04d.png -vcodec libx264 -pix_fmt yuv420p {outdir}/{vidname}.mp4'
+        subprocess.call(cmd, shell=True)
+
+    elif process == 'truncation':
+        if not seeds or len(seeds) != 1:
+            ctx.fail('truncation requires a single seed value (use --seeds=123)')
+        dirpath = os.path.join(outdir, 'frames')
+        os.makedirs(dirpath, exist_ok=True)
+        seed = seeds[0]
+        vidname = f'{process}-seed_{seed}-start_{start}-stop_{stop}-inc_{increment}-{fps}fps'
+        truncation_traversal(G, device, seeds, label, start, stop, increment, noise_mode, dirpath)
+        cmd = f'ffmpeg -y -r {fps} -i {dirpath}/frame%04d.png -vcodec libx264 -pix_fmt yuv420p {outdir}/{vidname}.mp4'
+        subprocess.call(cmd, shell=True)
 
 #----------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(
-        description='Generate images using pretrained network pickle.',
-        epilog=_examples,
-        formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-
-    subparsers = parser.add_subparsers(help='Sub-commands', dest='command')
-
-    parser_generate_images = subparsers.add_parser('generate-images', help='Generate images')
-    parser_generate_images.add_argument('--network', help='Network pickle filename', dest='network_pkl', required=True)
-    parser_generate_images.add_argument('--seeds', type=_parse_num_range, help='List of random seeds', dest='seeds', required=True)
-    parser_generate_images.add_argument('--trunc', type=float, help='Truncation psi (default: %(default)s)', dest='truncation_psi', default=0.5)
-    parser_generate_images.add_argument('--class', dest='class_idx', type=int, help='Class label (default: unconditional)')
-    parser_generate_images.add_argument('--create-grid', action='store_true', help='Add flag to save the generated images in a grid', dest='grid')
-    parser_generate_images.add_argument('--outdir', help='Root directory for run results (default: %(default)s)', default='out', metavar='DIR')
-    parser_generate_images.add_argument('--save_vector', dest='save_vector', action='store_true', help='also save vector in .npy format')
-    parser_generate_images.add_argument('--fixnoise', action='store_true', help='generate images using fixed noise (more accurate for interpolations)')
-    parser_generate_images.add_argument('--jpg_quality', type=int, help='Quality compression for JPG exports (1 to 95), keep default value to export as PNG', default=0)
-    parser_generate_images.set_defaults(func=generate_images)
-
-    parser_truncation_traversal = subparsers.add_parser('truncation-traversal', help='Generate truncation walk')
-    parser_truncation_traversal.add_argument('--network', help='Network pickle filename', dest='network_pkl', required=True)
-    parser_truncation_traversal.add_argument('--seed', type=_parse_num_range, help='Singular seed value')
-    parser_truncation_traversal.add_argument('--npys', type=_parse_npy_files, help='List of .npy files')
-    parser_truncation_traversal.add_argument('--fps', type=int, help='Starting value',default=24,dest='framerate')
-    parser_truncation_traversal.add_argument('--start', type=float, help='Starting value')
-    parser_truncation_traversal.add_argument('--stop', type=float, help='Stopping value')
-    parser_truncation_traversal.add_argument('--increment', type=float, help='Incrementing value')
-    parser_truncation_traversal.add_argument('--outdir', help='Root directory for run results (default: %(default)s)', default='out', metavar='DIR')
-    parser_truncation_traversal.set_defaults(func=truncation_traversal)
-
-    parser_generate_latent_walk = subparsers.add_parser('generate-latent-walk', help='Generate latent walk')
-    parser_generate_latent_walk.add_argument('--network', help='Network pickle filename', dest='network_pkl', required=True)
-    parser_generate_latent_walk.add_argument('--trunc', type=float, help='Truncation psi (default: %(default)s)', dest='truncation_psi', default=0.5)
-    parser_generate_latent_walk.add_argument('--walk-type', help='Type of walk (default: %(default)s)', default='line')
-    parser_generate_latent_walk.add_argument('--frames', type=int, help='Frame count (default: %(default)s', default=240)
-    parser_generate_latent_walk.add_argument('--fps', type=int, help='Starting value',default=24,dest='framerate')
-    parser_generate_latent_walk.add_argument('--seeds', type=_parse_num_range, help='List of random seeds')
-    parser_generate_latent_walk.add_argument('--npys', type=_parse_npy_files, help='List of .npy files')
-    parser_generate_latent_walk.add_argument('--save_vector', dest='save_vector', action='store_true', help='also save vector in .npy format')
-    parser_generate_latent_walk.add_argument('--diameter', type=float, help='diameter of noise loop', default=2.0)
-    parser_generate_latent_walk.add_argument('--start_seed', type=int, help='random seed to start noise loop from', default=0)
-    parser_generate_latent_walk.add_argument('--outdir', help='Root directory for run results (default: %(default)s)', default='out', metavar='DIR')
-    parser_generate_latent_walk.set_defaults(func=generate_latent_walk)
-
-    parser_generate_neighbors = subparsers.add_parser('generate-neighbors', help='Generate random neighbors of a seed')
-    parser_generate_neighbors.add_argument('--network', help='Network pickle filename', dest='network_pkl', required=True)
-    parser_generate_neighbors.add_argument('--seeds', type=_parse_num_range, help='List of random seeds')
-    parser_generate_neighbors.add_argument('--npys', type=_parse_npy_files, help='List of .npy files')
-    parser_generate_neighbors.add_argument('--diameter', type=float, help='distance around seed to sample from', default=0.1)
-    parser_generate_neighbors.add_argument('--save_vector', dest='save_vector', action='store_true', help='also save vector in .npy format')
-    parser_generate_neighbors.add_argument('--num_samples', type=int, help='How many neighbors to generate (default: %(default)s', default=25)
-    parser_generate_neighbors.add_argument('--trunc', type=float, help='Truncation psi (default: %(default)s)', dest='truncation_psi', default=0.5)
-    parser_generate_neighbors.add_argument('--outdir', help='Root directory for run results (default: %(default)s)', default='out', metavar='DIR')
-    parser_generate_neighbors.set_defaults(func=generate_neighbors)
-
-    parser_lerp_video = subparsers.add_parser('lerp-video', help='Generate interpolation video (lerp) between random vectors')
-    parser_lerp_video.add_argument('--network', help='Path to network pickle filename', dest='network_pkl', required=True)
-    parser_lerp_video.add_argument('--seeds', type=_parse_num_range_ext, help='List of random seeds', dest='seeds', required=True)
-    parser_lerp_video.add_argument('--grid-w', type=int, help='Video grid width/columns (default: %(default)s)', default=None, dest='grid_w')
-    parser_lerp_video.add_argument('--grid-h', type=int, help='Video grid height/rows (default: %(default)s)', default=None, dest='grid_h')
-    parser_lerp_video.add_argument('--trunc', type=float, help='Truncation psi (default: %(default)s)', default=1.0, dest='truncation_psi')
-    parser_lerp_video.add_argument('--slowdown', type=int, help='Slowdown the video by this amount; must be a power of 2 (default: %(default)s)', default=1, dest='slowdown')
-    parser_lerp_video.add_argument('--duration-sec', type=float, help='Duration of video (default: %(default)s)', default=30.0, dest='duration_sec')
-    parser_lerp_video.add_argument('--fps', type=int, help='FPS of generated video (default: %(default)s)', default=30, dest='mp4_fps')
-    parser_lerp_video.add_argument('--outdir', help='Root directory for run results (default: %(default)s)', default='out', metavar='DIR')
-    parser_lerp_video.set_defaults(func=lerp_video)
-
-    args = parser.parse_args()
-    kwargs = vars(args)
-    subcmd = kwargs.pop('command')
-
-    if subcmd is None:
-        print('Error: missing subcommand.  Re-run with --help for usage.')
-        sys.exit(1)
-
-    func = kwargs.pop('func')
-    func(**kwargs)
-
-#----------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    generate_images()  # pylint: disable=no-value-for-parameter
 
 #----------------------------------------------------------------------------
